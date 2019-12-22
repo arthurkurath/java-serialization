@@ -5,69 +5,78 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.ObjectStreamConstants;
-import java.io.UTFDataFormatException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
-import java.util.ListIterator;
 import java.util.Map;
 import java.util.Objects;
 
-import ch.xcal.serialization.parser.content.IClassDesc;
-import ch.xcal.serialization.parser.content.IContent;
-import ch.xcal.serialization.parser.content.impl.ArrayContent;
-import ch.xcal.serialization.parser.content.impl.BlockDataContent;
-import ch.xcal.serialization.parser.content.impl.BooleanContent;
-import ch.xcal.serialization.parser.content.impl.ByteContent;
-import ch.xcal.serialization.parser.content.impl.CharContent;
-import ch.xcal.serialization.parser.content.impl.ClassDesc;
-import ch.xcal.serialization.parser.content.impl.DoubleContent;
-import ch.xcal.serialization.parser.content.impl.EnumContent;
-import ch.xcal.serialization.parser.content.impl.ExceptionContent;
-import ch.xcal.serialization.parser.content.impl.FieldDesc;
-import ch.xcal.serialization.parser.content.impl.FloatContent;
-import ch.xcal.serialization.parser.content.impl.IntegerContent;
-import ch.xcal.serialization.parser.content.impl.LongContent;
-import ch.xcal.serialization.parser.content.impl.ObjectContent;
-import ch.xcal.serialization.parser.content.impl.ProxyClassDesc;
-import ch.xcal.serialization.parser.content.impl.ResetContent;
-import ch.xcal.serialization.parser.content.impl.ShortContent;
-import ch.xcal.serialization.parser.content.impl.StringContent;
-import ch.xcal.serialization.parser.content.impl.TypeDesc;
-import ch.xcal.serialization.parser.content.impl.TypeDesc.ArrayTypeDesc;
-import ch.xcal.serialization.parser.content.impl.TypeDesc.ObjectTypeDesc;
-import ch.xcal.serialization.parser.content.impl.TypeDesc.PrimitiveTypeDesc;
-import ch.xcal.serialization.parser.handle.IClassDescHandle;
-import ch.xcal.serialization.parser.handle.IHandle;
-import ch.xcal.serialization.parser.handle.impl.ArrayHandle;
-import ch.xcal.serialization.parser.handle.impl.ClassDescHandle;
-import ch.xcal.serialization.parser.handle.impl.EnumHandle;
-import ch.xcal.serialization.parser.handle.impl.NullHandle;
-import ch.xcal.serialization.parser.handle.impl.ObjectHandle;
+import ch.xcal.serialization.common.ModifiedUTFHelper;
+import ch.xcal.serialization.stream.IHandle;
+import ch.xcal.serialization.stream.IPrimitiveElementOrHandle;
+import ch.xcal.serialization.stream.IReferencedStreamElement;
+import ch.xcal.serialization.stream.IRootStreamElement;
+import ch.xcal.serialization.stream.SerializationStream;
+import ch.xcal.serialization.stream.descs.AbstractFieldDesc;
+import ch.xcal.serialization.stream.descs.AbstractFieldDesc.PrimitiveFieldDesc;
+import ch.xcal.serialization.stream.descs.AbstractFieldDesc.ReferenceFieldDesc;
+import ch.xcal.serialization.stream.descs.AbstractTypeDesc;
+import ch.xcal.serialization.stream.descs.AbstractTypeDesc.ArrayTypeDesc;
+import ch.xcal.serialization.stream.descs.AbstractTypeDesc.PrimitiveTypeDesc;
+import ch.xcal.serialization.stream.descs.IFieldDesc;
+import ch.xcal.serialization.stream.primitive.BooleanElement;
+import ch.xcal.serialization.stream.primitive.ByteElement;
+import ch.xcal.serialization.stream.primitive.CharElement;
+import ch.xcal.serialization.stream.primitive.DoubleElement;
+import ch.xcal.serialization.stream.primitive.FloatElement;
+import ch.xcal.serialization.stream.primitive.IntegerElement;
+import ch.xcal.serialization.stream.primitive.LongElement;
+import ch.xcal.serialization.stream.primitive.ShortElement;
+import ch.xcal.serialization.stream.ref.ArrayElement;
+import ch.xcal.serialization.stream.ref.ClassDescElement;
+import ch.xcal.serialization.stream.ref.ClassElement;
+import ch.xcal.serialization.stream.ref.EnumElement;
+import ch.xcal.serialization.stream.ref.IClassDescElement;
+import ch.xcal.serialization.stream.ref.ObjectElement;
+import ch.xcal.serialization.stream.ref.ProxyClassDescElement;
+import ch.xcal.serialization.stream.ref.StringElement;
+import ch.xcal.serialization.stream.root.BlockDataElement;
+import ch.xcal.serialization.stream.root.ExceptionMarker;
+import ch.xcal.serialization.stream.root.NullHandle;
+import ch.xcal.serialization.stream.root.ResetMarker;
+import ch.xcal.serialization.stream.root.handle.ArrayHandle;
+import ch.xcal.serialization.stream.root.handle.ClassDescHandle;
+import ch.xcal.serialization.stream.root.handle.ClassHandle;
+import ch.xcal.serialization.stream.root.handle.EnumHandle;
+import ch.xcal.serialization.stream.root.handle.ObjectHandle;
+import ch.xcal.serialization.stream.root.handle.StringHandle;
 
+/**
+ * Parser for a serialization stream.
+ * 
+ * https://docs.oracle.com/javase/8/docs/platform/serialization/spec/protocol.html
+ */
 public class Parser {
 	private final DataInputStream byteStream;
-	static final int READ_UTF_STRING_BUFFER_SIZE = 4096;
 
-	public static ParserResult parse(final InputStream inputStream) throws IOException {
+	public static SerializationStream parse(final InputStream inputStream) throws IOException {
 		return new Parser(inputStream).parse();
 	}
 
 	// stream state
-	private int resetCounter = -1;
 	private int nextHandle;
-	private Map<Integer, Map<Integer, IHandle>> handleMap = new HashMap<>();
-	private Map<IHandle, IContent> referenceMap = new HashMap<>();
+	private Map<Integer, IHandle<?>> handleMap = new HashMap<>();
+	// handles are only marker objects, i.e. can be compared using identity
+	private Map<IHandle<?>, IReferencedStreamElement> referenceMap = new IdentityHashMap<>();
 
 	// stream values
-	private short magicNumber = -1;
-	private short streamVersion = -1;
-	private List<IContent> contents = new ArrayList<>();
+	private List<IRootStreamElement> rootElements = new ArrayList<>();
 
 	protected Parser(InputStream inputStream) throws IOException {
 		Objects.requireNonNull(inputStream);
-		if (inputStream instanceof DataInputStream) {
+		if (inputStream.getClass() == DataInputStream.class) {
 			byteStream = (DataInputStream) inputStream;
 		} else {
 			byteStream = new DataInputStream(inputStream);
@@ -76,41 +85,44 @@ public class Parser {
 	}
 
 	// helpers
-	private ResetContent resetStream() {
-		resetCounter++;
-		handleMap.put(resetCounter, new HashMap<>());
+	private ResetMarker resetStream() {
+		handleMap = new HashMap<>();
 		nextHandle = 0x7E0000;
-		return ResetContent.INSTANCE;
+		return ResetMarker.INSTANCE;
 	}
 
 	private NullHandle nullReference() {
 		return NullHandle.INSTANCE;
 	}
 
-	private void putReference(IHandle handle, IContent referencedObject) {
+	private <REF extends IReferencedStreamElement> void putReference(IHandle<REF> handle, REF referencedObject) {
 		if (referenceMap.containsKey(handle)) {
 			throw new IllegalArgumentException("Handle already exists");
 		}
 		referenceMap.put(handle, Objects.requireNonNull(referencedObject));
 	}
 
-	private IContent resolveReference(IHandle handle) {
+	private <REF extends IReferencedStreamElement> REF resolveReference(IHandle<REF> handle) {
 		if (!referenceMap.containsKey(handle)) {
 			throw new IllegalArgumentException("Unknown handle");
 		}
-		return referenceMap.get(handle);
+		return handle.getReferencedStreamElementClass().cast(referenceMap.get(handle));
 	}
 
-	private <T extends IHandle> T newHandle(Class<T> handleClass, IContent referencedObject) {
+	private <T extends IHandle<REF>, REF extends IReferencedStreamElement> T newHandle(Class<T> handleClass, REF referencedObject) {
 		T newHandle = newHandle(handleClass);
 		putReference(newHandle, referencedObject);
 		return newHandle;
 	}
 
-	private <T extends IHandle> T newHandle(Class<T> handleClass) {
-		final IHandle newHandle;
+	private <T extends IHandle<?>> T newHandle(Class<T> handleClass) {
+		final IHandle<?> newHandle;
 		if (handleClass == ClassDescHandle.class) {
 			newHandle = new ClassDescHandle();
+		} else if (handleClass == ClassHandle.class) {
+			newHandle = new ClassHandle();
+		} else if (handleClass == StringHandle.class) {
+			newHandle = new StringHandle();
 		} else if (handleClass == ObjectHandle.class) {
 			newHandle = new ObjectHandle();
 		} else if (handleClass == ArrayHandle.class) {
@@ -120,54 +132,51 @@ public class Parser {
 		} else {
 			throw new IllegalArgumentException("unknown handle " + handleClass);
 		}
-		handleMap.get(resetCounter).put(nextHandle++, newHandle);
-		@SuppressWarnings("unchecked")
-		T result = (T) newHandle;
-		return result;
+		handleMap.put(nextHandle, newHandle);
+		nextHandle++;
+		return handleClass.cast(newHandle);
 	}
 
-	private <T extends IHandle> T prevObject(final Class<T> expectedClass) throws IOException {
-		final int handleNr = (byteStream.readUnsignedShort() << 16) + byteStream.readUnsignedShort();
-		final IHandle handle = handleMap.get(resetCounter).get(handleNr);
-		if (handle == null || !expectedClass.isInstance(handle)) {
-			throw new IllegalStateException("Handle does not match: " + handleNr);
+	private <T extends IHandle<?>> T prevObject(final Class<T> expectedClass) throws IOException {
+		final int handleNr = byteStream.readInt();
+		final IHandle<?> handle = handleMap.get(handleNr);
+		if (handle == null) {
+			throw new IllegalStateException("Handle not found: " + handleNr);
 		}
-		@SuppressWarnings("unchecked")
-		T result = (T) handle;
-		return result;
+		return expectedClass.cast(handle);
 	}
 
-	public ParserResult parse() throws IOException {
+	public SerializationStream parse() throws IOException {
 		readMagicNumber();
 		readVersion();
 		try {
 			while (true) {
 				try {
-					contents.add(readContent(byteStream.readByte()));
+					rootElements.add(readContent(byteStream.readByte()));
 				} catch (ParsedSerializedException e) {
-					contents.add(e.getExceptionHandle());
+					rootElements.add(e.getExceptionHandle());
 				}
 			}
 		} catch (EOFException e) {
-			return ParserResult.create(referenceMap, contents);
+			return SerializationStream.create(referenceMap, rootElements);
 		}
 	}
 
 	private void readMagicNumber() throws IOException {
-		magicNumber = byteStream.readShort();
-		if (magicNumber != ((short) 0xACED)) {
+		short magicNumber = byteStream.readShort();
+		if (magicNumber != SerializationStream.MAGIC_NUMBER) {
 			throw new IllegalStateException("magic number");
 		}
 	}
 
 	private void readVersion() throws IOException {
-		streamVersion = byteStream.readShort();
-		if (streamVersion != 5) {
+		short streamVersion = byteStream.readShort();
+		if (streamVersion != SerializationStream.STREAM_VERSION) {
 			throw new IllegalStateException("stream version");
 		}
 	}
 
-	private IContent readContent(final byte contentType) throws ParsedSerializedException {
+	private IRootStreamElement readContent(final byte contentType) throws ParsedSerializedException {
 		try {
 			if (contentType != ObjectStreamConstants.TC_BLOCKDATA && contentType != ObjectStreamConstants.TC_BLOCKDATALONG) {
 				return readObject(contentType);
@@ -179,7 +188,7 @@ public class Parser {
 		}
 	}
 
-	private IContent readObject(final byte contentType) throws ParsedSerializedException, IOException {
+	private IRootStreamElement readObject(final byte contentType) throws ParsedSerializedException, IOException {
 		switch (contentType) {
 			case ObjectStreamConstants.TC_OBJECT :
 				return readNewObject();
@@ -210,7 +219,7 @@ public class Parser {
 		}
 	}
 
-	private IContent readBlockData(final byte contentType) throws IOException {
+	private BlockDataElement readBlockData(final byte contentType) throws IOException {
 		final int length;
 		switch (contentType) {
 			case ObjectStreamConstants.TC_BLOCKDATA :
@@ -224,136 +233,158 @@ public class Parser {
 		}
 		final byte[] blockData = new byte[length];
 		byteStream.readFully(blockData);
-		return BlockDataContent.create(blockData);
+		return BlockDataElement.create(blockData);
 	}
 
 	private ObjectHandle readNewObject() throws ParsedSerializedException, IOException {
-		final IContent classDesc0 = resolveReference(readClassDesc());
-		if (!(classDesc0 instanceof IClassDesc)) {
-			throw new IllegalStateException("class desc is not instance of ClassDesc");
-		}
+		final ClassDescHandle classDescHandle = readClassDesc();
 		final ObjectHandle handle = newHandle(ObjectHandle.class);
-		final List<IClassDesc> classHierarchy = ((ClassDesc) classDesc0).getClassHierarchy();
-		// start with superclass
-		final ListIterator<IClassDesc> classHierarchyIt = classHierarchy.listIterator(classHierarchy.size());
-		ObjectContent lastReadObject = null;
-		while (classHierarchyIt.hasPrevious()) {
-			final IClassDesc classDesc = classHierarchyIt.previous();
-			final byte classDescFlags = classDesc.getFlags();
-			final ObjectContent object;
-			if ((ObjectStreamConstants.SC_SERIALIZABLE & classDescFlags) > 0x0) {
-				final List<IContent> fields = new ArrayList<>(classDesc.getFields().size());
-				for (final FieldDesc field : classDesc.getFields()) {
-					fields.add(readContent(field.getType()));
-				}
-				if ((ObjectStreamConstants.SC_WRITE_METHOD & classDescFlags) > 0x0) {
-					object = ObjectContent.create(classDesc, fields, readObjectAnnotation(), lastReadObject);
-				} else {
-					object = ObjectContent.create(classDesc, fields, Collections.emptyList(), lastReadObject);
-				}
-			} else if ((ObjectStreamConstants.SC_EXTERNALIZABLE & classDescFlags) > 0x0) {
-				if ((ObjectStreamConstants.SC_BLOCK_DATA & classDescFlags) > 0x0) {
-					object = ObjectContent.createWithAnnotationsOnly(classDesc, readObjectAnnotation(), lastReadObject);
-				} else {
-					throw new UnsupportedOperationException("Cannot read external contents which were not written in block data mode");
-				}
-			} else {
-				throw new UnsupportedOperationException("Cannot read class with flags " + classDescFlags);
-			}
-			lastReadObject = object;
-		}
-
-		putReference(handle, lastReadObject);
+		putReference(handle, readObjectRec(classDescHandle));
 		return handle;
 	}
 
-	private IContent readContent(final TypeDesc type) throws ParsedSerializedException, IOException {
+	private ObjectElement readObjectRec(final ClassDescHandle classDescHandle) throws ParsedSerializedException, IOException {
+		final IClassDescElement classDesc = resolveReference(classDescHandle);
+		final ObjectElement superClassObject = classDesc.getSuperClassHandle() != null
+				? readObjectRec(classDesc.getSuperClassHandle())
+				: null;
+		final byte classDescFlags = classDesc.getFlags();
+		if ((ObjectStreamConstants.SC_SERIALIZABLE & classDescFlags) > 0x0) {
+			final List<IPrimitiveElementOrHandle> fields = new ArrayList<>(classDesc.getFields().size());
+			for (final IFieldDesc field : classDesc.getFields()) {
+				if (field instanceof PrimitiveFieldDesc) {
+					fields.add(readPrimitiveValue(((PrimitiveFieldDesc) field).getType()));
+				} else {
+					fields.add(readReferenceValue());
+				}
+			}
+			if ((ObjectStreamConstants.SC_WRITE_METHOD & classDescFlags) > 0x0) {
+				return ObjectElement.create(classDescHandle, fields, readObjectAnnotation(), superClassObject);
+			} else {
+				return ObjectElement.create(classDescHandle, fields, Collections.emptyList(), superClassObject);
+			}
+		} else if ((ObjectStreamConstants.SC_EXTERNALIZABLE & classDescFlags) > 0x0) {
+			if ((ObjectStreamConstants.SC_BLOCK_DATA & classDescFlags) > 0x0) {
+				return ObjectElement.createWithAnnotationsOnly(classDescHandle, readObjectAnnotation(), superClassObject);
+			} else {
+				throw new UnsupportedOperationException("Cannot read external contents which were not written in block data mode");
+			}
+		} else {
+			throw new UnsupportedOperationException("Cannot read class with flags " + classDescFlags);
+		}
+	}
+
+	private IPrimitiveElementOrHandle readPrimitiveValue(final PrimitiveTypeDesc type) throws ParsedSerializedException, IOException {
 		if (PrimitiveTypeDesc.BYTE == type) {
-			return ByteContent.create(byteStream.readByte());
+			return ByteElement.create(byteStream.readByte());
 		} else if (PrimitiveTypeDesc.CHAR == type) {
-			return CharContent.create(byteStream.readChar());
+			return CharElement.create(byteStream.readChar());
 		} else if (PrimitiveTypeDesc.DOUBLE == type) {
-			return DoubleContent.create(byteStream.readDouble());
+			return DoubleElement.create(byteStream.readDouble());
 		} else if (PrimitiveTypeDesc.FLOAT == type) {
-			return FloatContent.create(byteStream.readFloat());
+			return FloatElement.create(byteStream.readFloat());
 		} else if (PrimitiveTypeDesc.INTEGER == type) {
-			return IntegerContent.create(byteStream.readInt());
+			return IntegerElement.create(byteStream.readInt());
 		} else if (PrimitiveTypeDesc.LONG == type) {
-			return LongContent.create(byteStream.readLong());
+			return LongElement.create(byteStream.readLong());
 		} else if (PrimitiveTypeDesc.SHORT == type) {
-			return ShortContent.create(byteStream.readShort());
+			return ShortElement.create(byteStream.readShort());
 		} else if (PrimitiveTypeDesc.BOOLEAN == type) {
-			return BooleanContent.create(byteStream.readBoolean());
-		} else if (type instanceof ObjectTypeDesc || type instanceof ArrayTypeDesc) {
-			return readObject(byteStream.readByte());
+			return BooleanElement.create(byteStream.readBoolean());
 		} else {
 			throw new UnsupportedOperationException("Unknown type " + type);
 		}
 	}
 
-	private ClassDescHandle readNewClass() throws ParsedSerializedException, IOException {
-		return newHandle(ClassDescHandle.class, readClassDesc());
+	private IPrimitiveElementOrHandle readReferenceValue() throws ParsedSerializedException, IOException {
+		// null or handle
+		return (IPrimitiveElementOrHandle) readObject(byteStream.readByte());
+	}
+
+	private ClassHandle readNewClass() throws ParsedSerializedException, IOException {
+		final ClassDescHandle classDescHandle = readClassDesc();
+		return newHandle(ClassHandle.class, ClassElement.create(classDescHandle));
 	}
 
 	private ArrayHandle readNewArray() throws ParsedSerializedException, IOException {
-		final IClassDescHandle classDesc = readClassDesc();
+		final ClassDescHandle classDesc = readClassDesc();
 		final ArrayHandle handle = newHandle(ArrayHandle.class);
 		final int size = byteStream.readInt();
-		final TypeDesc type0 = TypeDesc.parse(((ClassDesc) resolveReference(classDesc)).getName());
+		final AbstractTypeDesc type0 = AbstractTypeDesc.parse(((ClassDescElement) resolveReference(classDesc)).getName());
 		if (!(type0 instanceof ArrayTypeDesc)) {
 			throw new IllegalStateException("Type is not an array");
 		}
 		final ArrayTypeDesc type = (ArrayTypeDesc) type0;
-		final List<IContent> elements = new ArrayList<>(size);
-		for (int i = 0; i < size; i++) {
-			elements.add(readContent(type.getComponentType()));
+		final List<IPrimitiveElementOrHandle> elements = new ArrayList<>(size);
+		if (type.getComponentType() instanceof PrimitiveTypeDesc) {
+			final PrimitiveTypeDesc componentType = (PrimitiveTypeDesc) type.getComponentType();
+			for (int i = 0; i < size; i++) {
+				elements.add(readPrimitiveValue(componentType));
+			}
+		} else {
+			for (int i = 0; i < size; i++) {
+				elements.add(readReferenceValue());
+			}
 		}
-		putReference(handle, ArrayContent.create(type, elements));
+		putReference(handle, ArrayElement.create(classDesc, elements));
 		return handle;
 	}
 
 	private EnumHandle readNewEnum() throws ParsedSerializedException, IOException {
-		final IClassDescHandle classDesc = readClassDesc();
+		final ClassDescHandle classDesc = readClassDesc();
 		final EnumHandle handle = newHandle(EnumHandle.class);
-		final String name = ((StringContent) resolveReference((ObjectHandle) readObject(byteStream.readByte()))).getValue();
-		putReference(handle, EnumContent.create((ClassDesc) resolveReference(classDesc), name));
+		putReference(handle, EnumElement.create(classDesc, readString()));
 		return handle;
 	}
 
-	private IClassDescHandle readClassDesc() throws ParsedSerializedException, IOException {
+	private StringHandle readString() throws ParsedSerializedException, IOException {
+		final byte stringType = byteStream.readByte();
+		switch (stringType) {
+			case ObjectStreamConstants.TC_STRING :
+				return newString(byteStream.readUnsignedShort());
+			case ObjectStreamConstants.TC_LONGSTRING :
+				return newString(byteStream.readLong());
+			case ObjectStreamConstants.TC_REFERENCE :
+				return prevObject(StringHandle.class);
+		}
+		throw new IllegalStateException("StringType: " + stringType);
+
+	}
+
+	private ClassDescHandle readClassDesc() throws ParsedSerializedException, IOException {
 		final byte classDescType = byteStream.readByte();
 		switch (classDescType) {
 			case ObjectStreamConstants.TC_CLASSDESC :
 				return readClass();
 			case ObjectStreamConstants.TC_PROXYCLASSDESC :
 				return readProxyClass();
-			case ObjectStreamConstants.TC_NULL :
-				return nullReference();
 			case ObjectStreamConstants.TC_REFERENCE :
 				return prevObject(ClassDescHandle.class);
+			case ObjectStreamConstants.TC_NULL :
+				return ClassDescHandle.NULL_CLASS_DESC_INSTANCE;
 		}
 		throw new IllegalStateException("ClassDescType: " + classDescType);
 	}
 
-	private IClassDescHandle readSuperClassDesc() throws ParsedSerializedException, IOException {
-		return readClassDesc();
+	private ClassDescHandle readSuperClass() throws ParsedSerializedException, IOException {
+		final ClassDescHandle superClass = readClassDesc();
+		return superClass == ClassDescHandle.NULL_CLASS_DESC_INSTANCE ? null : superClass;
 	}
 
 	private ClassDescHandle readClass() throws ParsedSerializedException, IOException {
-		final String className = readUtf(byteStream.readUnsignedShort());
+		final String className = ModifiedUTFHelper.readUTF(byteStream, byteStream.readUnsignedShort());
 		final long serialVersionUID = byteStream.readLong();
 		final ClassDescHandle handle = newHandle(ClassDescHandle.class);
 		final byte classDescFlags = byteStream.readByte();
 		final short numberOfFields = byteStream.readShort();
-		final List<FieldDesc> fieldDescs = new ArrayList<>(numberOfFields);
+		final List<IFieldDesc> fieldDescs = new ArrayList<>(numberOfFields);
 		for (short i = 0; i < numberOfFields; i++) {
 			fieldDescs.add(readFieldDesc());
 		}
-		final List<IContent> classAnnotations = readClassAnnotation();
-
-		final IClassDescHandle superClass = readSuperClassDesc();
-		putReference(handle, ClassDesc.create(className, serialVersionUID, classDescFlags, fieldDescs, classAnnotations,
-				superClass == NullHandle.INSTANCE ? null : (IClassDesc) resolveReference(superClass)));
+		final List<IRootStreamElement> classAnnotations = readClassAnnotation();
+		final ClassDescHandle superClass = readSuperClass();
+		putReference(handle,
+				ClassDescElement.create(className, serialVersionUID, classDescFlags, fieldDescs, classAnnotations, superClass));
 		return handle;
 	}
 
@@ -362,25 +393,24 @@ public class Parser {
 		final int numberOfInterfaces = byteStream.readInt();
 		final List<String> interfaces = new ArrayList<>(numberOfInterfaces);
 		for (int i = 0; i < numberOfInterfaces; i++) {
-			interfaces.add(readUtf(byteStream.readUnsignedShort()));
+			interfaces.add(ModifiedUTFHelper.readUTF(byteStream, byteStream.readUnsignedShort()));
 		}
-		final List<IContent> classAnnotations = readClassAnnotation();
-		final IClassDescHandle superClass = readSuperClassDesc();
-		putReference(handle, ProxyClassDesc.create(interfaces, classAnnotations,
-				superClass == NullHandle.INSTANCE ? null : (IClassDesc) resolveReference(superClass)));
+		final List<IRootStreamElement> classAnnotations = readClassAnnotation();
+		final ClassDescHandle superClass = readSuperClass();
+		putReference(handle, ProxyClassDescElement.create(interfaces, classAnnotations, superClass));
 		return handle;
 	}
 
-	private List<IContent> readClassAnnotation() throws ParsedSerializedException, IOException {
+	private List<IRootStreamElement> readClassAnnotation() throws ParsedSerializedException, IOException {
 		return readAnnotations();
 	}
 
-	private List<IContent> readObjectAnnotation() throws ParsedSerializedException, IOException {
+	private List<IRootStreamElement> readObjectAnnotation() throws ParsedSerializedException, IOException {
 		return readAnnotations();
 	}
 
-	private List<IContent> readAnnotations() throws ParsedSerializedException, IOException {
-		final List<IContent> annotations = new ArrayList<>();
+	private List<IRootStreamElement> readAnnotations() throws ParsedSerializedException, IOException {
+		final List<IRootStreamElement> annotations = new ArrayList<>();
 		byte contentType;
 		while ((contentType = byteStream.readByte()) != ObjectStreamConstants.TC_ENDBLOCKDATA) {
 			annotations.add(readContent(contentType));
@@ -388,131 +418,47 @@ public class Parser {
 		return annotations;
 	}
 
-	private FieldDesc readFieldDesc() throws ParsedSerializedException, IOException {
+	private AbstractFieldDesc readFieldDesc() throws ParsedSerializedException, IOException {
 		final char typeCodeChar = (char) byteStream.readUnsignedByte();
-		final String fieldName = readUtf(byteStream.readUnsignedShort());
+		final String fieldName = ModifiedUTFHelper.readUTF(byteStream, byteStream.readUnsignedShort());
 
-		final String type;
-		if (typeCodeChar == '[' || typeCodeChar == 'L') {
-			// read class name descriptor
-			type = ((StringContent) resolveReference((ObjectHandle) readObject(byteStream.readByte()))).getValue();
-
+		if (typeCodeChar == '[') {
+			final StringHandle typeHandle = readString();
+			return ReferenceFieldDesc.createArray(fieldName, typeHandle);
+		} else if (typeCodeChar == 'L') {
+			final StringHandle typeHandle = readString();
+			return ReferenceFieldDesc.createObject(fieldName, typeHandle);
 		} else {
-			type = Character.toString(typeCodeChar);
+			final PrimitiveTypeDesc type = (PrimitiveTypeDesc) AbstractTypeDesc.parse(Character.toString(typeCodeChar));
+			return PrimitiveFieldDesc.create(fieldName, type);
 		}
-		return FieldDesc.create(TypeDesc.parse(type), fieldName);
 	}
 
 	private ObjectHandle readException() throws ParsedSerializedException, IOException {
 		resetStream();
 		final ObjectHandle throwableHandle = (ObjectHandle) readObject(byteStream.readByte());
 		resetStream();
-		throw new ParsedSerializedException(ExceptionContent.create(throwableHandle));
+		throw new ParsedSerializedException(ExceptionMarker.create(throwableHandle));
 	}
 
-	private ObjectHandle newString(final long stringBytes) throws IOException {
+	private StringHandle newString(final long stringBytes) throws IOException {
 		if (stringBytes < 0 || stringBytes > Integer.MAX_VALUE) {
 			throw new IllegalStateException("String length: " + stringBytes);
 		}
-		return newHandle(ObjectHandle.class, StringContent.create(readUtf((int) stringBytes)));
-	}
-
-	private String readUtf(int stringBytes) throws IOException {
-		int processedBytes = 0;
-		final byte[] buffer = new byte[Math.min(READ_UTF_STRING_BUFFER_SIZE, stringBytes)];
-		final char[] result = new char[stringBytes];
-		int bufferOffset = 0;
-		int bufferCounter;
-		int bufferSize;
-		int resultCounter = 0;
-		int nextChar;
-		int nextChar2;
-		int nextChar3;
-
-		while (processedBytes < stringBytes) {
-			bufferCounter = 0;
-			bufferSize = Math.min(buffer.length - bufferOffset, stringBytes - processedBytes - bufferOffset);
-			byteStream.readFully(buffer, bufferOffset, bufferSize);
-			if (bufferOffset > 0) {
-				bufferSize = bufferSize + bufferOffset;
-				bufferOffset = 0;
-			}
-
-			processBytes : while (bufferCounter < bufferSize) {
-				nextChar = (int) buffer[bufferCounter] & 0xFF;
-				bufferCounter++;
-				if (nextChar <= 127) {
-					result[resultCounter] = (char) nextChar;
-					resultCounter++;
-					processedBytes++;
-				} else {
-					switch (nextChar >> 4) {
-						case 12 :
-						case 13 :
-							// two byte unicode (110x xxxx 10xx xxxx)
-							if (processedBytes + 1 >= stringBytes) {
-								throw new UTFDataFormatException("Partial character at the end");
-							} else if (bufferCounter >= bufferSize) {
-								buffer[0] = buffer[bufferSize - 1];
-								bufferOffset = 1;
-								break processBytes;
-							}
-							nextChar2 = (int) buffer[bufferCounter] & 0xFF;
-							bufferCounter++;
-							processedBytes += 2;
-							if ((nextChar2 & 0xC0) != 0x80) {
-								throw new UTFDataFormatException("Illegal partial character at offset " + processedBytes);
-							}
-							result[resultCounter] = (char) (((nextChar & 0x1F) << 6) | (nextChar2 & 0x3F));
-							resultCounter++;
-							break;
-
-						case 14 :
-							// three byte unicode (1110 xxxx 10xx xxxx 10xx xxxx)
-							if (processedBytes + 2 >= stringBytes) {
-								throw new UTFDataFormatException("Partial character at the end");
-							} else if (bufferCounter >= bufferSize) {
-								buffer[0] = buffer[bufferSize - 1];
-								bufferOffset = 1;
-								break processBytes;
-							} else if (bufferCounter + 1 >= bufferSize) {
-								buffer[0] = buffer[bufferSize - 2];
-								buffer[1] = buffer[bufferSize - 1];
-								bufferOffset = 2;
-								break processBytes;
-							}
-							nextChar2 = (int) buffer[bufferCounter] & 0xFF;
-							bufferCounter++;
-							nextChar3 = (int) buffer[bufferCounter] & 0xFF;
-							bufferCounter++;
-							processedBytes += 3;
-							if ((nextChar2 & 0xC0) != 0x80 || (nextChar3 & 0xC0) != 0x80) {
-								throw new UTFDataFormatException("Illegal partial character at offset " + processedBytes);
-							}
-							result[resultCounter] = (char) (((nextChar & 0x0F) << 12) | ((nextChar2 & 0x3F) << 6) | (nextChar3 & 0x3F));
-							resultCounter++;
-							break;
-
-						default :
-							throw new UTFDataFormatException("Illegal UTF-Sequence at offset " + processedBytes);
-					}
-				}
-			}
-		}
-		return new String(result, 0, resultCounter);
+		return newHandle(StringHandle.class, StringElement.create(ModifiedUTFHelper.readUTF(byteStream, (int) stringBytes)));
 	}
 
 	private static class ParsedSerializedException extends Exception {
 
 		private static final long serialVersionUID = 1L;
 
-		private final ExceptionContent exceptionHandle;
+		private final ExceptionMarker exceptionHandle;
 
-		public ParsedSerializedException(final ExceptionContent handle) {
+		public ParsedSerializedException(final ExceptionMarker handle) {
 			this.exceptionHandle = Objects.requireNonNull(handle);
 		}
 
-		public ExceptionContent getExceptionHandle() {
+		public ExceptionMarker getExceptionHandle() {
 			return exceptionHandle;
 		}
 	}

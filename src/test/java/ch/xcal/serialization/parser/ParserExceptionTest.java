@@ -11,18 +11,18 @@ import java.io.Serializable;
 
 import org.junit.Test;
 
-import ch.xcal.serialization.parser.content.IContent;
-import ch.xcal.serialization.parser.content.impl.ClassDesc;
-import ch.xcal.serialization.parser.content.impl.ExceptionContent;
-import ch.xcal.serialization.parser.content.impl.ObjectContent;
-import ch.xcal.serialization.parser.content.impl.StringContent;
-import ch.xcal.serialization.parser.handle.impl.ObjectHandle;
+import ch.xcal.serialization.stream.IStreamElement;
+import ch.xcal.serialization.stream.SerializationStream;
+import ch.xcal.serialization.stream.ref.ClassDescElement;
+import ch.xcal.serialization.stream.ref.ObjectElement;
+import ch.xcal.serialization.stream.ref.StringElement;
+import ch.xcal.serialization.stream.root.ExceptionMarker;
+import ch.xcal.serialization.stream.root.handle.StringHandle;
 
 public class ParserExceptionTest {
 
 	@Test
 	public void testParseException() throws IOException {
-
 		final ByteArrayOutputStream o = new ByteArrayOutputStream();
 		final ObjectOutputStream out = new ObjectOutputStream(o);
 		out.writeObject("BeforeException");
@@ -33,23 +33,45 @@ public class ParserExceptionTest {
 		}
 		out.writeObject("AfterException");
 		out.flush();
-		final ParserResult result = Parser.parse(new ByteArrayInputStream(o.toByteArray()));
-		assertEquals(3, result.getContents().size());
+		final SerializationStream result = Parser.parse(new ByteArrayInputStream(o.toByteArray()));
+		assertEquals(3, result.getRootElements().size());
 
-		assertTrue(result.getContents().get(0) instanceof ObjectHandle);
-		final IContent content1 = result.getContent((ObjectHandle) result.getContents().get(0));
-		assertTrue(content1 instanceof StringContent);
-		assertEquals("BeforeException", ((StringContent) content1).getValue());
+		assertTrue(result.getRootElements().get(0) instanceof StringHandle);
+		final IStreamElement content1 = result.resolveHandle((StringHandle) result.getRootElements().get(0));
+		assertTrue(content1 instanceof StringElement);
+		assertEquals("BeforeException", ((StringElement) content1).getValue());
 
-		assertTrue(result.getContents().get(1) instanceof ExceptionContent);
-		final ObjectContent throwableContent = (ObjectContent) result
-				.getContent(((ExceptionContent) result.getContents().get(1)).getThrowableHandle());
-		assertEquals(IOException.class.getName(), ((ClassDesc) throwableContent.getClassDesc()).getName());
+		assertTrue(result.getRootElements().get(1) instanceof ExceptionMarker);
+		final ObjectElement throwableContent = (ObjectElement) result
+				.resolveHandle(((ExceptionMarker) result.getRootElements().get(1)).getThrowableHandle());
+		assertEquals(IOException.class.getName(), ((ClassDescElement) result.resolveHandle(throwableContent.getClassDesc())).getName());
 
-		assertTrue(result.getContents().get(2) instanceof ObjectHandle);
-		final IContent content3 = result.getContent((ObjectHandle) result.getContents().get(2));
-		assertTrue(content3 instanceof StringContent);
-		assertEquals("AfterException", ((StringContent) content3).getValue());
+		assertTrue(result.getRootElements().get(2) instanceof StringHandle);
+		final IStreamElement content3 = result.resolveHandle((StringHandle) result.getRootElements().get(2));
+		assertTrue(content3 instanceof StringElement);
+		assertEquals("AfterException", ((StringElement) content3).getValue());
+	}
+
+	@Test
+	public void testParseExceptionInArray() throws IOException {
+		final ByteArrayOutputStream o = new ByteArrayOutputStream();
+		final ObjectOutputStream out = new ObjectOutputStream(o);
+		try {
+			out.writeObject(new Object[]{
+					"FirstElement",
+					new ExceptionThrower(new IOException()),
+					"LastElement"
+			});
+		} catch (IOException e) {
+			// nop
+		}
+		out.flush();
+		final SerializationStream result = Parser.parse(new ByteArrayInputStream(o.toByteArray()));
+		assertEquals(1, result.getRootElements().size());
+		assertTrue(result.getRootElements().get(0) instanceof ExceptionMarker);
+		final ObjectElement throwableContent = (ObjectElement) result
+				.resolveHandle(((ExceptionMarker) result.getRootElements().get(0)).getThrowableHandle());
+		assertEquals(IOException.class.getName(), ((ClassDescElement) result.resolveHandle(throwableContent.getClassDesc())).getName());
 	}
 
 	private static class ExceptionThrower implements Serializable {
